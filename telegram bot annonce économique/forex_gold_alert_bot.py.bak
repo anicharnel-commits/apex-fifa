@@ -1,0 +1,697 @@
+"""
+Forex / Gold 24h Alert Bot
+- FMP economic calendar: USD + High Impact only
+- RSS financial/geopolitical news + Gemini analysis
+- Telegram alerts
+- 15-minute main loop
+- Exact T-30 calendar alerts are scheduled with a timer after the calendar is fetched.
+- Duplicate notifications are persisted in a small JSON state file.
+
+IMPORTANT:
+Never put API keys directly in this file. Use environment variables.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import feedparser
+import requests
+from dateutil import parser as date_parser
+from google import genai
+from google.genai import types
+
+
+# =========================
+# Configuration
+# =========================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+
+# Gemini model can be changed without modifying the logic.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+# Main loop requested by the project.
+LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "900"))  # 15 minutes
+
+# Exact T-30 alerts are scheduled with a timer.
+CALENDAR_ALERT_MINUTES_BEFORE = 30
+
+# Only send a geopolitical/news alert when Gemini confidence >= this value.
+GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.80"))
+
+# FMP endpoint currently documented/used by FMP integrations.
+FMP_CALENDAR_URL = os.getenv(
+    "FMP_CALENDAR_URL",
+    "https://financialmodelingprep.com/stable/economic-calendar",
+)
+
+# RSS feeds are configurable. Reuters RSS availability can vary by region/provider,
+# so the list is deliberately configurable rather than hard-coded as mandatory.
+RSS_FEEDS = [
+    x.strip()
+    for x in os.getenv(
+        "RSS_FEEDS",
+        ",".join(
+            [
+                "https://www.fxstreet.com/rss/news",
+                "https://feeds.reuters.com/reuters/businessNews",
+                "https://feeds.reuters.com/reuters/worldNews",
+            ]
+        ),
+    ).split(",")
+    if x.strip()
+]
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+STATE_FILE = Path(os.getenv("STATE_FILE", "alert_state.json"))
+
+# Abidjan/Côte d'Ivoire is UTC. For another location, set TIMEZONE_OFFSET_HOURS.
+TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "0"))
+LOCAL_TZ = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
+
+# News keywords: deliberately weighted toward the requested Gold/Forex drivers.
+PRIORITY_KEYWORDS = [
+    "oil",
+    "crude",
+    "brent",
+    "wti",
+    "dollar",
+    "usd",
+    "fed",
+    "federal reserve",
+    "ecb",
+    "european central bank",
+    "central bank",
+    "interest rate",
+    "rates",
+    "inflation",
+    "cpi",
+    "ppi",
+    "war",
+    "invasion",
+    "missile",
+    "attack",
+    "airstrike",
+    "conflict",
+    "military",
+    "sanctions",
+    "ceasefire",
+    "geopolitical",
+    "iran",
+    "israel",
+    "ukraine",
+    "russia",
+    "china",
+    "taiwan",
+    "banking crisis",
+    "financial crisis",
+    "default",
+]
+
+# =========================
+# Logging
+# =========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("forex-gold-alert")
+
+
+# =========================
+# State / deduplication
+# =========================
+
+state_lock = threading.Lock()
+scheduled_timers: dict[str, threading.Timer] = {}
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"sent_calendar": [], "sent_news": []}
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return {
+            "sent_calendar": list(data.get("sent_calendar", [])),
+            "sent_news": list(data.get("sent_news", [])),
+        }
+    except Exception:
+        logger.exception("Impossible de lire %s; état réinitialisé.", STATE_FILE)
+        return {"sent_calendar": [], "sent_news": []}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(STATE_FILE)
+
+
+STATE = load_state()
+
+
+def already_sent(kind: str, event_id: str) -> bool:
+    with state_lock:
+        return event_id in STATE.get(kind, [])
+
+
+def mark_sent(kind: str, event_id: str) -> None:
+    with state_lock:
+        STATE.setdefault(kind, [])
+        if event_id not in STATE[kind]:
+            STATE[kind].append(event_id)
+            # Keep the state file small.
+            STATE[kind] = STATE[kind][-2000:]
+            save_state(STATE)
+
+
+# =========================
+# Generic helpers
+# =========================
+
+def safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def normalize_currency(value: Any) -> str:
+    return safe_text(value).upper()
+
+
+def normalize_impact(item: dict[str, Any]) -> str:
+    """
+    FMP field names can vary between API versions/data products.
+    Accept common names and values.
+    """
+    raw = (
+        item.get("impact")
+        or item.get("importance")
+        or item.get("priority")
+        or item.get("impactLevel")
+        or ""
+    )
+    text = safe_text(raw).lower()
+
+    if text in {"3", "high", "high impact", "red", "3.0"}:
+        return "high"
+    if "high" in text or "red" in text:
+        return "high"
+    return text
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        dt = date_parser.parse(str(value))
+        if dt.tzinfo is None:
+            # FMP feeds can provide timestamps without an offset.
+            # We interpret those as UTC by default.
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        logger.warning("Date impossible à parser: %r", value)
+        return None
+
+
+def event_key(prefix: str, *parts: Any) -> str:
+    raw = "|".join(safe_text(x) for x in parts)
+    return prefix + ":" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+# =========================
+# Telegram
+# =========================
+
+def send_telegram(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID manquant.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException:
+        logger.exception("Erreur Telegram.")
+        return False
+
+
+# =========================
+# FMP economic calendar
+# =========================
+
+def fetch_fmp_calendar() -> list[dict[str, Any]]:
+    if not FMP_API_KEY:
+        raise RuntimeError("FMP_API_KEY manquant.")
+
+    now = datetime.now(timezone.utc)
+    start = now.date().isoformat()
+    end = (now + timedelta(days=1)).date().isoformat()
+
+    response = requests.get(
+        FMP_CALENDAR_URL,
+        params={
+            "from": start,
+            "to": end,
+            "apikey": FMP_API_KEY,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+
+    if isinstance(data, dict):
+        # Be tolerant if the API wraps the array.
+        for key in ("data", "results", "economicCalendar", "calendar"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        return []
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+def extract_calendar_datetime(item: dict[str, Any]) -> datetime | None:
+    for key in (
+        "date",
+        "datetime",
+        "eventDate",
+        "releaseDate",
+        "time",
+    ):
+        dt = parse_datetime(item.get(key))
+        if dt:
+            return dt
+    return None
+
+
+def filter_usd_high_impact(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    FINAL RULE:
+    Only USD + High Impact events can trigger economic alerts.
+    EUR is intentionally excluded.
+    """
+    filtered = []
+
+    for item in items:
+        currency = normalize_currency(
+            item.get("currency") or item.get("countryCurrency")
+        )
+        impact = normalize_impact(item)
+
+        if currency == "USD" and impact == "high":
+            filtered.append(item)
+
+    return filtered
+
+
+def schedule_exact_t30_alert(item: dict[str, Any]) -> None:
+    event_dt = extract_calendar_datetime(item)
+    if not event_dt:
+        return
+
+    now = datetime.now(timezone.utc)
+    target = event_dt - timedelta(minutes=CALENDAR_ALERT_MINUTES_BEFORE)
+    delay = (target - now).total_seconds()
+
+    # Too late: do not manufacture a T-30 alert.
+    if delay < 0:
+        return
+
+    name = safe_text(
+        item.get("event")
+        or item.get("title")
+        or item.get("name")
+        or item.get("description")
+        or "Annonce USD"
+    )
+    key = event_key("calendar", name, event_dt.isoformat(), "USD")
+
+    if already_sent("sent_calendar", key):
+        return
+
+    with state_lock:
+        if key in scheduled_timers:
+            return
+
+        def fire() -> None:
+            try:
+                # Re-check before sending in case another process/loop handled it.
+                if already_sent("sent_calendar", key):
+                    return
+
+                event_local = event_dt.astimezone(LOCAL_TZ)
+                message = (
+                    "⚠️ ALERTE ÉCONOMIQUE USD\n\n"
+                    f"🇺🇸 {name}\n"
+                    f"⏰ Heure : {event_local:%H:%M:%S}\n"
+                    "🟥 Impact : HIGH\n"
+                    "⏳ Dans 30 minutes\n\n"
+                    "👉 Pense à couper tes bots MT5 et à vérifier tes positions."
+                )
+
+                if send_telegram(message):
+                    mark_sent("sent_calendar", key)
+            except Exception:
+                logger.exception("Erreur lors de l'envoi de l'alerte T-30.")
+            finally:
+                with state_lock:
+                    scheduled_timers.pop(key, None)
+
+        timer = threading.Timer(delay, fire)
+        timer.daemon = True
+        scheduled_timers[key] = timer
+        timer.start()
+
+    logger.info(
+        "Alerte T-30 programmée: %s à %s (dans %.1f min)",
+        name,
+        event_dt.isoformat(),
+        delay / 60,
+    )
+
+
+def process_economic_calendar() -> None:
+    try:
+        items = fetch_fmp_calendar()
+        events = filter_usd_high_impact(items)
+
+        logger.info("FMP: %d événement(s) USD High Impact détecté(s).", len(events))
+
+        for item in events:
+            schedule_exact_t30_alert(item)
+
+    except Exception:
+        logger.exception("Module calendrier économique indisponible.")
+
+
+# =========================
+# RSS news
+# =========================
+
+def keyword_score(title: str, summary: str = "") -> int:
+    text = f"{title} {summary}".lower()
+    return sum(1 for keyword in PRIORITY_KEYWORDS if keyword in text)
+
+
+def fetch_rss_items() -> list[dict[str, str]]:
+    all_items: list[dict[str, str]] = []
+
+    for feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+
+            if getattr(feed, "bozo", False):
+                logger.warning("RSS potentiellement invalide: %s", feed_url)
+
+            for entry in feed.entries[:30]:
+                title = safe_text(getattr(entry, "title", ""))
+                link = safe_text(getattr(entry, "link", ""))
+                summary = safe_text(
+                    getattr(entry, "summary", "")
+                    or getattr(entry, "description", "")
+                )
+
+                if not title:
+                    continue
+
+                published = safe_text(
+                    getattr(entry, "published", "")
+                    or getattr(entry, "updated", "")
+                )
+
+                all_items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "summary": summary,
+                        "published": published,
+                        "source": feed_url,
+                    }
+                )
+
+        except Exception:
+            logger.exception("Erreur RSS: %s", feed_url)
+
+    # Deduplicate by title/link.
+    unique: dict[str, dict[str, str]] = {}
+    for item in all_items:
+        key = event_key("rss", item["title"], item["link"])
+        unique[key] = item
+
+    # Prioritize stories containing requested Gold/Forex drivers.
+    return sorted(
+        unique.values(),
+        key=lambda x: keyword_score(x["title"], x["summary"]),
+        reverse=True,
+    )
+
+
+# =========================
+# Gemini geopolitical analysis
+# =========================
+
+def build_gemini_client() -> genai.Client:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY manquant.")
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def analyze_with_gemini(
+    client: genai.Client,
+    title: str,
+    summary: str,
+) -> dict[str, Any]:
+    """
+    Gemini returns strict JSON:
+    {
+      "alert": true/false,
+      "confidence": 0.0-1.0,
+      "severity": "low|medium|high|critical",
+      "reason": "...",
+      "gold_forex_impact": "..."
+    }
+    """
+
+    prompt = f"""
+Analyze this financial/geopolitical news item for a Forex + Gold risk-monitoring bot.
+
+TITLE:
+{title}
+
+SUMMARY:
+{summary[:3000]}
+
+Priority drivers:
+1. Oil / crude / Brent / WTI
+2. USD / dollar liquidity
+3. Wars, attacks, invasions, military escalation, sanctions, ceasefires
+4. Central banks, especially Federal Reserve and ECB
+5. Inflation, CPI/PPI, interest rates
+6. Banking/financial crises and sovereign default risk
+
+Question:
+Does this headline indicate a sudden or major geopolitical/financial event
+that could create significant short-term volatility in USD-related Forex pairs
+and/or Gold?
+
+Be conservative. Routine political commentary, ordinary market commentary,
+old/recycled stories, scheduled economic releases, and minor incidents are NOT
+enough.
+
+Return ONLY valid JSON with exactly these fields:
+{{
+  "alert": true or false,
+  "confidence": number between 0 and 1,
+  "severity": "low" | "medium" | "high" | "critical",
+  "reason": "short explanation",
+  "gold_forex_impact": "short explanation"
+}}
+"""
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=300,
+        ),
+    )
+
+    text = safe_text(response.text)
+
+    # Strip accidental Markdown fences.
+    text = re.sub(r"^```json\s*", "", text, flags=re.I)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        # Last-resort extraction of a JSON object.
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            raise ValueError(f"Gemini JSON invalide: {text[:500]}")
+        result = json.loads(match.group(0))
+
+    return result
+
+
+def process_news() -> None:
+    try:
+        client = build_gemini_client()
+        items = fetch_rss_items()
+
+        # Analyze only a manageable number per cycle to control API usage.
+        candidates = [
+            item for item in items
+            if keyword_score(item["title"], item["summary"]) > 0
+        ][:15]
+
+        logger.info("RSS: %d titre(s) prioritaire(s) à analyser.", len(candidates))
+
+        for item in candidates:
+            key = event_key("news", item["title"], item["link"])
+
+            if already_sent("sent_news", key):
+                continue
+
+            try:
+                result = analyze_with_gemini(
+                    client,
+                    item["title"],
+                    item["summary"],
+                )
+
+                alert = bool(result.get("alert", False))
+                confidence = float(result.get("confidence", 0))
+                severity = safe_text(result.get("severity", "low")).lower()
+
+                if (
+                    alert
+                    and confidence >= GEMINI_MIN_CONFIDENCE
+                    and severity in {"high", "critical"}
+                ):
+                    reason = safe_text(result.get("reason", "Risque détecté"))
+                    impact = safe_text(
+                        result.get("gold_forex_impact", "Impact potentiel Gold/Forex.")
+                    )
+
+                    message = (
+                        "🚨 ALERTE VOLATILITÉ — GOLD / FOREX\n\n"
+                        f"📰 {item['title']}\n"
+                        f"🔥 Sévérité : {severity.upper()}\n"
+                        f"🎯 Confiance IA : {confidence:.0%}\n\n"
+                        f"⚠️ {reason}\n"
+                        f"📈 Impact potentiel : {impact}\n\n"
+                        "👉 Vérifie tes positions et envisage de couper tes bots MT5."
+                    )
+
+                    if item["link"]:
+                        message += f"\n\n🔗 {item['link']}"
+
+                    if send_telegram(message):
+                        mark_sent("sent_news", key)
+
+            except Exception:
+                logger.exception(
+                    "Gemini a échoué pour le titre: %s",
+                    item["title"],
+                )
+
+    except Exception:
+        logger.exception("Module news/Gemini indisponible.")
+
+
+# =========================
+# Main loop
+# =========================
+
+def validate_configuration() -> None:
+    missing = [
+        name
+        for name, value in {
+            "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+            "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+            "GEMINI_API_KEY": GEMINI_API_KEY,
+            "FMP_API_KEY": FMP_API_KEY,
+        }.items()
+        if not value
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Variables d'environnement manquantes: " + ", ".join(missing)
+        )
+
+
+def main() -> None:
+    validate_configuration()
+
+    logger.info("==============================================")
+    logger.info("Forex / Gold Alert Bot démarré")
+    logger.info("Boucle principale: %d secondes", LOOP_SECONDS)
+    logger.info("Calendrier: USD + HIGH IMPACT uniquement")
+    logger.info("News: pétrole, USD, guerres, banques centrales, inflation...")
+    logger.info("==============================================")
+
+    # Initial check immediately.
+    while True:
+        cycle_started = time.time()
+
+        process_economic_calendar()
+        process_news()
+
+        elapsed = time.time() - cycle_started
+        sleep_for = max(1, LOOP_SECONDS - int(elapsed))
+
+        logger.info(
+            "Cycle terminé. Prochain cycle dans environ %d secondes.",
+            sleep_for,
+        )
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Arrêt demandé par l'utilisateur.")
+    except Exception:
+        logger.exception("Arrêt fatal.")
+        raise
